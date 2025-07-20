@@ -1,0 +1,275 @@
+// options.js
+
+// Only MV3-supported types
+const ALL_TYPES = [
+  'cache',
+  'cacheStorage',
+  'cookies',
+  'downloads',
+  'formData',
+  'history',
+  'indexedDB',
+  'localStorage',
+  'passwords',
+  'serviceWorkers'
+];
+
+const form = document.getElementById('settingsForm');
+const saveBtn = document.getElementById('save');
+const statusEl = document.getElementById('status');
+const lastRunEl = document.getElementById('lastRun');
+const filterList = document.getElementById('filterList');
+const newFilterIn = document.getElementById('newFilterOrigin');
+const addFilterBt = document.getElementById('addFilterOrigin');
+const selectAllBt = document.getElementById('selectAll');
+const deselectAllBt = document.getElementById('deselectAll');
+const typesContainer = document.getElementById('types');
+const clearNowBt = document.getElementById('clearNow');
+const clearFiltBt = document.getElementById('clearFiltered');
+const downloadLogsBt = document.getElementById('downloadLogs');
+const clearLogsBt = document.getElementById('clearLogs');
+const logList = document.getElementById('logList');
+
+let currentSettings = null;
+let isDirty = false;
+
+function sendMessage(msg) {
+  return new Promise(resolve => chrome.runtime.sendMessage(msg, resolve));
+}
+
+function showStatus(text, timeout = 1500) {
+  statusEl.textContent = text;
+  setTimeout(() => statusEl.textContent = '', timeout);
+}
+
+function markDirty() {
+  isDirty = true;
+  saveBtn.disabled = false;
+  statusEl.textContent = '';
+}
+
+// Renders one origin filter row
+function renderFilter(origin) {
+  const tmpl = document.getElementById('filterItemTemplate').content.cloneNode(true);
+  const li = tmpl.querySelector('li');
+  tmpl.querySelector('.origin').textContent = origin;
+
+  tmpl.querySelector('.removeFilter').addEventListener('click', () => {
+    currentSettings.filters = currentSettings.filters.filter(o => o !== origin);
+    li.remove();
+    markDirty();
+    updateFilteredClearButton();
+  });
+
+  tmpl.querySelector('.clearThis').addEventListener('click', () => {
+    clearSite(origin);
+  });
+
+  filterList.appendChild(li);
+  updateFilteredClearButton();
+}
+
+// Renders one log entry
+function renderLog({ timestamp, details }) {
+  const tmpl = document.getElementById('logEntryTemplate').content.cloneNode(true);
+  tmpl.querySelector('time').setAttribute('datetime', timestamp);
+  tmpl.querySelector('time').textContent = new Date(timestamp).toLocaleString();
+  tmpl.querySelector('.details').textContent = details;
+  logList.appendChild(tmpl);
+  logList.scrollTop = logList.scrollHeight;
+}
+
+async function loadLogs() {
+  logList.innerHTML = '';
+  const { logs } = await sendMessage({ action: 'getLogs' });
+  logs.forEach(renderLog);
+}
+
+// Disable “Clear Filtered” if there are no filters
+function updateFilteredClearButton() {
+  clearFiltBt.disabled = !currentSettings.filters.length;
+}
+
+// Update “Last cleared” timestamp
+function updateLastRun(ts) {
+  lastRunEl.textContent = 'Last cleared: ' +
+    (ts ? new Date(ts).toLocaleString() : 'never');
+}
+
+// Build the checkboxes for each type
+function renderTypeCheckboxes() {
+  typesContainer.innerHTML = '';
+  ALL_TYPES.forEach(type => {
+    const label = document.createElement('label');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.id = type;
+    cb.name = 'types';
+    cb.value = type;
+    cb.title = `Clear ${type}`;
+
+    label.appendChild(cb);
+    label.appendChild(document.createTextNode(
+      type.replace(/([A-Z])/g, ' $1').replace(/^./, s => s.toUpperCase())
+    ));
+    typesContainer.appendChild(label);
+  });
+}
+
+// Pull data back out of the form
+function getFormData() {
+  const types = Array.from(
+    typesContainer.querySelectorAll('input[name="types"]:checked')
+  ).map(cb => cb.id);
+
+  return {
+    enabled: form.elements['enabled'].checked,
+    interval: parseInt(form.elements['interval'].value, 10),
+    quietStart: form.elements['quietStart'].value,
+    quietEnd: form.elements['quietEnd'].value,
+    notifications: form.elements['notifications'].checked,
+    types,
+    filters: [...currentSettings.filters],
+    lastRun: currentSettings.lastRun
+  };
+}
+
+// Fill the form once we get settings from background
+async function populateForm(settings) {
+  currentSettings = settings;
+
+  // Basic settings
+  form.elements['enabled'].checked = settings.enabled;
+  form.elements['interval'].value = settings.interval;
+  form.elements['quietStart'].value = settings.quietStart;
+  form.elements['quietEnd'].value = settings.quietEnd;
+  form.elements['notifications'].checked = settings.notifications;
+
+  // Types
+  renderTypeCheckboxes();
+  typesContainer.querySelectorAll('input[name="types"]').forEach(cb => {
+    cb.checked = settings.types.includes(cb.id);
+  });
+
+  // Filters
+  filterList.innerHTML = '';
+  settings.filters.forEach(renderFilter);
+  updateFilteredClearButton();
+
+  // Logs and last-run
+  updateLastRun(settings.lastRun);
+  await loadLogs();
+
+  saveBtn.disabled = true;
+}
+
+// Send updated settings to background
+async function saveSettings() {
+  const data = getFormData();
+  await sendMessage({ action: 'saveSettings', settings: data });
+  currentSettings = data;
+  saveBtn.disabled = true;
+  showStatus('Settings saved');
+}
+
+// Clear everything right now
+async function clearAllNow() {
+  clearNowBt.disabled = true;
+  const res = await sendMessage({ action: 'clearNow' });
+  renderLog(res.log);
+  updateLastRun(res.settings.lastRun);
+  clearNowBt.disabled = false;
+}
+
+// Clear only filtered origins
+async function clearFilteredNow() {
+  clearFiltBt.disabled = true;
+  const res = await sendMessage({ action: 'clearFiltered' });
+  renderLog(res.log);
+  updateLastRun(res.settings.lastRun);
+  clearFiltBt.disabled = false;
+}
+
+// Clear a single site
+async function clearSite(origin) {
+  const res = await sendMessage({ action: 'clearSite', origin });
+  renderLog(res.log);
+  updateLastRun(res.settings.lastRun);
+}
+
+// Download logs as CSV
+async function downloadLogs() {
+  const { logs } = await sendMessage({ action: 'getLogs' });
+  const csv = logs
+    .map(l => `"${l.timestamp}","${l.details.replace(/"/g, '""')}"`)
+    .join('\n');
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'clear-logs.csv';
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// Wipe all logs
+async function clearAllLogs() {
+  await sendMessage({ action: 'clearLogs' });
+  logList.innerHTML = '';
+}
+
+// Bootstrap on load
+document.addEventListener('DOMContentLoaded', async () => {
+  const { settings } = await sendMessage({ action: 'getSettings' });
+  await populateForm(settings);
+});
+
+form.addEventListener('input', markDirty);
+
+form.elements['interval'].addEventListener('input', () => {
+  const errEl = document.getElementById('intervalError');
+  if (!form.elements['interval'].validity.valid) {
+    errEl.textContent = form.elements['interval'].validationMessage;
+    saveBtn.disabled = true;
+  } else {
+    errEl.textContent = '';
+    if (isDirty) saveBtn.disabled = false;
+  }
+});
+
+form.addEventListener('submit', e => {
+  e.preventDefault();
+  if (!form.elements['interval'].validity.valid) return;
+  saveSettings();
+});
+
+addFilterBt.addEventListener('click', () => {
+  const url = newFilterIn.value.trim();
+  if (!url) return;
+  try {
+    new URL(url);
+  } catch {
+    return;
+  }
+  if (!currentSettings.filters.includes(url)) {
+    currentSettings.filters.push(url);
+    renderFilter(url);
+    markDirty();
+  }
+  newFilterIn.value = '';
+});
+
+selectAllBt.addEventListener('click', () => {
+  typesContainer.querySelectorAll('input[name="types"]').forEach(cb => cb.checked = true);
+  markDirty();
+});
+
+deselectAllBt.addEventListener('click', () => {
+  typesContainer.querySelectorAll('input[name="types"]').forEach(cb => cb.checked = false);
+  markDirty();
+});
+
+clearNowBt.addEventListener('click', clearAllNow);
+clearFiltBt.addEventListener('click', clearFilteredNow);
+downloadLogsBt.addEventListener('click', downloadLogs);
+clearLogsBt.addEventListener('click', clearAllLogs);
